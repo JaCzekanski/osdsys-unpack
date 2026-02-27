@@ -4,6 +4,8 @@ import struct
 import sys
 import os
 
+from find_osdsys_symbols import match_symbols
+
 ROMDIR_ENTRY = struct.Struct("<10sHI")  # name[10], ext_info_size, file_size
 ELF_HDR = struct.Struct("<4s12sHHIIIIIHHHHHH")
 PHDR = struct.Struct("<IIIIIIII")
@@ -101,8 +103,22 @@ def parse_elf(data):
         "ehsize": e_ehsize, "phentsize": e_phentsize, "shentsize": e_shentsize,
     }, phdrs, data
 
-def build_elf(hdr, segments):
-    """segments: list of (vaddr, bytes) tuples"""
+SHDR = struct.Struct("<IIIIIIIIII")  # 40 bytes
+SYMTAB_ENTRY = struct.Struct("<IIIBBH")  # 16 bytes
+
+# ELF symbol type/binding helpers
+STB_GLOBAL = 1
+STT_FUNC = 2
+STT_OBJECT = 1
+STT_NOTYPE = 0
+SHT_NULL = 0
+SHT_SYMTAB = 2
+SHT_STRTAB = 3
+SHF_ALLOC = 2
+
+def build_elf(hdr, segments, symbols=None):
+    """segments: list of (vaddr, bytes) tuples
+    symbols: optional list of (name, addr, type, size) tuples"""
     phoff = ELF_HDR.size
     data_start = (phoff + PHDR.size * len(segments) + 0xF) & ~0xF
 
@@ -112,12 +128,14 @@ def build_elf(hdr, segments):
         seg_offsets.append(off)
         off += (len(d) + 0xF) & ~0xF
 
+    # Build segment data first
     out = bytearray()
+    # Placeholder ELF header - will be patched later if we have symbols
     out += ELF_HDR.pack(
         b"\x7fELF", hdr["ident"], hdr["type"], hdr["machine"],
         hdr["version"], hdr["entry"], phoff, 0,
         hdr["flags"], hdr["ehsize"], PHDR.size, len(segments),
-        hdr["shentsize"], 0, 0)
+        0, 0, 0)
 
     for i, (vaddr, d) in enumerate(segments):
         out += PHDR.pack(PT_LOAD, seg_offsets[i], vaddr, vaddr,
@@ -129,6 +147,90 @@ def build_elf(hdr, segments):
         out += d
         pad = ((len(d) + 0xF) & ~0xF) - len(d)
         out += b"\x00" * pad
+
+    if symbols:
+        # Determine which section index each symbol belongs to
+        seg_ranges = []
+        for i, (vaddr, d) in enumerate(segments):
+            seg_ranges.append((vaddr, vaddr + len(d)))
+
+        def find_shndx(addr):
+            for i, (lo, hi) in enumerate(seg_ranges):
+                if lo <= addr < hi:
+                    return i + 1  # section 0 is SHT_NULL
+            return 0  # SHN_UNDEF
+
+        # Build .strtab
+        strtab = bytearray(b"\x00")  # index 0 = empty string
+        sym_name_offsets = []
+        for name, addr, stype, size in symbols:
+            sym_name_offsets.append(len(strtab))
+            strtab += name.encode("ascii") + b"\x00"
+
+        # Build .symtab
+        symtab = bytearray()
+        # Entry 0: STN_UNDEF (null symbol)
+        symtab += SYMTAB_ENTRY.pack(0, 0, 0, 0, 0, 0)
+        for i, (name, addr, stype, size) in enumerate(symbols):
+            if stype == "func":
+                st_type = STT_FUNC
+            elif stype in ("data", "asciz", "s32", "u32", "s16", "u16", "s8", "u8"):
+                st_type = STT_OBJECT
+            else:
+                st_type = STT_NOTYPE
+            st_info = (STB_GLOBAL << 4) | st_type
+            shndx = find_shndx(addr)
+            symtab += SYMTAB_ENTRY.pack(sym_name_offsets[i], addr, size, st_info, 0, shndx)
+
+        # Build .shstrtab
+        shstrtab = bytearray(b"\x00")
+        shstrtab_name = len(shstrtab); shstrtab += b".shstrtab\x00"
+        strtab_name = len(shstrtab); shstrtab += b".strtab\x00"
+        symtab_name = len(shstrtab); shstrtab += b".symtab\x00"
+
+        # Align and append section data
+        pad = ((len(out) + 3) & ~3) - len(out)
+        out += b"\x00" * pad
+
+        strtab_off = len(out)
+        out += strtab
+
+        pad = ((len(out) + 3) & ~3) - len(out)
+        out += b"\x00" * pad
+
+        symtab_off = len(out)
+        out += symtab
+
+        pad = ((len(out) + 3) & ~3) - len(out)
+        out += b"\x00" * pad
+
+        shstrtab_off = len(out)
+        out += shstrtab
+
+        # Align section header table to 4 bytes
+        pad = ((len(out) + 3) & ~3) - len(out)
+        out += b"\x00" * pad
+
+        shoff = len(out)
+        # Section headers: [0]=NULL, [1]=.strtab, [2]=.symtab, [3]=.shstrtab
+        # SHT_NULL
+        out += SHDR.pack(0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
+        # .strtab
+        out += SHDR.pack(strtab_name, SHT_STRTAB, 0, 0, strtab_off, len(strtab), 0, 0, 1, 0)
+        # .symtab (sh_link=1 -> .strtab, sh_info=1 -> first global symbol index)
+        out += SHDR.pack(symtab_name, SHT_SYMTAB, 0, 0, symtab_off, len(symtab),
+                         1, 1, 4, SYMTAB_ENTRY.size)
+        # .shstrtab
+        out += SHDR.pack(shstrtab_name, SHT_STRTAB, 0, 0, shstrtab_off, len(shstrtab), 0, 0, 1, 0)
+
+        e_shnum = 4
+        e_shstrndx = 3
+
+        # Patch ELF header with section header info
+        struct.pack_into("<I", out, 32, shoff)       # e_shoff
+        struct.pack_into("<H", out, 46, SHDR.size)   # e_shentsize
+        struct.pack_into("<H", out, 48, e_shnum)     # e_shnum
+        struct.pack_into("<H", out, 50, e_shstrndx)  # e_shstrndx
 
     return bytes(out)
 
@@ -143,7 +245,11 @@ def unpack_osdsys(module):
     segments = [((VADDR, decompressed))]
     hdr["entry"] = VADDR
 
-    return build_elf(hdr, segments)
+    print("Matching symbols...")
+    symbols = match_symbols(VADDR, decompressed)
+    print(f"Matched {len(symbols)} symbols")
+
+    return build_elf(hdr, segments, symbols)
 
 def main():
     parser = argparse.ArgumentParser(description="Extract modules from PS2 BIOS dumps")
@@ -185,7 +291,7 @@ def main():
 
     with open(output_path, "wb") as f:
         f.write(module)
-    print(f"Written {output_path} ({len(module)} bytes)")
+    print(f"\nWritten {output_path} ({len(module)} bytes)")
 
 if __name__ == "__main__":
     main()

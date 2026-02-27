@@ -1,0 +1,3 @@
+__pycache__/
+*.elf
+symbol_addrs.txt
